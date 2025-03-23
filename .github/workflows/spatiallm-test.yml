@@ -10,47 +10,46 @@ on:
 jobs:
   test-spatiallm:
     runs-on: ubuntu-latest
-    container:
-      image: nvidia/cuda:12.4.0-devel-ubuntu22.04
-      options: --gpus all
+    defaults:
+      run:
+        shell: bash -l {0}
     
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
       
+      - name: Set up Conda
+        uses: conda-incubator/setup-miniconda@v2
+        with:
+          miniconda-version: "latest"
+          python-version: 3.11
+          activate-environment: spatiallm
+          auto-activate-base: false
+          channel-priority: strict
+          show-channel-urls: true
+      
       - name: Install system dependencies
         run: |
-          apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y \
-            python3-pip python3-dev git wget curl \
-            libsparsehash-dev \
+          sudo apt-get update && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
             libgl1-mesa-glx xvfb
-      
-      - name: Setup Python
+
+      - name: Install Conda packages
         run: |
-          ln -sf /usr/bin/python3 /usr/bin/python
-          python -m pip install --upgrade pip
+          conda install -y -c conda-forge sparsehash python-poetry
       
-      - name: Install conda
+      - name: Install Python dependencies
         run: |
-          wget https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-Linux-x86_64.sh -O miniforge.sh
-          bash miniforge.sh -b -p $HOME/miniforge
-          echo "$HOME/miniforge/bin" >> $GITHUB_PATH
-          source $HOME/miniforge/bin/activate
-      
-      - name: Setup conda environment
-        run: |
-          conda create -n spatiallm python=3.11 -y
-          conda activate spatiallm
-          conda install -y -c nvidia/label/cuda-12.4.0 cuda-toolkit
-          conda install -y -c conda-forge sparsehash
-      
-      - name: Install dependencies
-        run: |
-          source $HOME/miniforge/bin/activate spatiallm
-          pip install poetry
+          # Install PyTorch CPU version first (before poetry to ensure CPU-only)
+          pip install torch==2.4.1+cpu torchvision==0.19.1+cpu -f https://download.pytorch.org/whl/torch_stable.html
+          
+          # Install dependencies with poetry
           poetry config virtualenvs.create false --local
-          poetry install
+          poetry install --no-interaction
+          
+          # CPU-only TorchSparse installation
           pip install git+https://github.com/mit-han-lab/torchsparse.git
+          
+          # Additional tools
           pip install huggingface_cli rerun-sdk
       
       - name: Log in to Hugging Face
@@ -64,8 +63,6 @@ jobs:
       
       - name: Download test data
         run: |
-          source $HOME/miniforge/bin/activate spatiallm
-          
           # Download test data only if HF_TOKEN is provided
           if [ -n "${{ secrets.HF_TOKEN }}" ]; then
             # Test data
@@ -89,12 +86,10 @@ jobs:
 
       - name: Run basic import test
         run: |
-          source $HOME/miniforge/bin/activate spatiallm
           python -c "import spatiallm; print('SpatialLM import successful')"
       
       - name: Test model creation (without actual inference)
         run: |
-          source $HOME/miniforge/bin/activate spatiallm
           python -c "
           from transformers import AutoConfig
           from spatiallm.model.spatiallm_llama import SpatialLMLlamaConfig, SpatialLMLlamaForCausalLM
@@ -125,8 +120,6 @@ jobs:
       
       - name: Test script execution paths (no actual inference)
         run: |
-          source $HOME/miniforge/bin/activate spatiallm
-          
           # Run inference.py with --help to test argument parsing
           python inference.py --help
           
@@ -138,8 +131,6 @@ jobs:
       
       - name: Run model preprocessing
         run: |
-          source $HOME/miniforge/bin/activate spatiallm
-          
           # Only run preprocessing if we have real test data
           if [ -f "test_data/pcd/scene0000_00.ply" ]; then
             python -c "
@@ -209,8 +200,6 @@ jobs:
       
       - name: Run E2E test with mock objects
         run: |
-          source $HOME/miniforge/bin/activate spatiallm
-          
           # Create a test script for mock E2E testing
           cat > test_e2e.py << 'EOL'
           import torch

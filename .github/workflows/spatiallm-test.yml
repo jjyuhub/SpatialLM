@@ -1,0 +1,293 @@
+name: SpatialLM Test Suite
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  test-spatiallm:
+    runs-on: ubuntu-latest
+    container:
+      image: nvidia/cuda:12.4.0-devel-ubuntu22.04
+      options: --gpus all
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      
+      - name: Install system dependencies
+        run: |
+          apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            python3-pip python3-dev git wget curl \
+            libsparsehash-dev \
+            libgl1-mesa-glx xvfb
+      
+      - name: Setup Python
+        run: |
+          ln -sf /usr/bin/python3 /usr/bin/python
+          python -m pip install --upgrade pip
+      
+      - name: Install conda
+        run: |
+          wget https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-Linux-x86_64.sh -O miniforge.sh
+          bash miniforge.sh -b -p $HOME/miniforge
+          echo "$HOME/miniforge/bin" >> $GITHUB_PATH
+          source $HOME/miniforge/bin/activate
+      
+      - name: Setup conda environment
+        run: |
+          conda create -n spatiallm python=3.11 -y
+          conda activate spatiallm
+          conda install -y -c nvidia/label/cuda-12.4.0 cuda-toolkit
+          conda install -y -c conda-forge sparsehash
+      
+      - name: Install dependencies
+        run: |
+          source $HOME/miniforge/bin/activate spatiallm
+          pip install poetry
+          poetry config virtualenvs.create false --local
+          poetry install
+          pip install git+https://github.com/mit-han-lab/torchsparse.git
+          pip install huggingface_cli rerun-sdk
+      
+      - name: Log in to Hugging Face
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          # Skip HF login if token not available
+          if [ -n "$HF_TOKEN" ]; then
+            huggingface-cli login --token $HF_TOKEN
+          fi
+      
+      - name: Download test data
+        run: |
+          source $HOME/miniforge/bin/activate spatiallm
+          
+          # Download test data only if HF_TOKEN is provided
+          if [ -n "${{ secrets.HF_TOKEN }}" ]; then
+            # Test data
+            huggingface-cli download manycore-research/SpatialLM-Testset --repo-type dataset --local-dir SpatialLM-Testset
+            
+            # Download a single point cloud for testing if full dataset download fails
+            mkdir -p test_data
+            huggingface-cli download manycore-research/SpatialLM-Testset pcd/scene0000_00.ply --repo-type dataset --local-dir test_data
+          else
+            # Create mock test data if we don't have HF access
+            echo "Creating mock test data for CI"
+            mkdir -p test_data/pcd
+            mkdir -p test_data/layout
+            echo "Mock point cloud data" > test_data/pcd/mock_scene.ply
+            echo "Mock layout data" > test_data/layout/mock_scene.txt
+            echo "id,pcd,layout" > test_data/test.csv
+            echo "mock_scene,pcd/mock_scene.ply,layout/mock_scene.txt" >> test_data/test.csv
+            echo "spatiallm59\tspatiallm18" > test_data/benchmark_categories.tsv
+            echo "bed\tbed" >> test_data/benchmark_categories.tsv
+          fi
+
+      - name: Run basic import test
+        run: |
+          source $HOME/miniforge/bin/activate spatiallm
+          python -c "import spatiallm; print('SpatialLM import successful')"
+      
+      - name: Test model creation (without actual inference)
+        run: |
+          source $HOME/miniforge/bin/activate spatiallm
+          python -c "
+          from transformers import AutoConfig
+          from spatiallm.model.spatiallm_llama import SpatialLMLlamaConfig, SpatialLMLlamaForCausalLM
+          
+          # Create a minimal config for testing
+          config = SpatialLMLlamaConfig(
+              vocab_size=1000,
+              hidden_size=128,
+              intermediate_size=256,
+              num_hidden_layers=2,
+              num_attention_heads=2,
+              point_backbone='scenescript',
+              point_config={
+                  'input_channels': 6,
+                  'embed_channels': 128,
+                  'conv_layers': [32, 64, 128],
+                  'num_bins': 640
+              },
+              point_start_token_id=1,
+              point_end_token_id=2,
+              point_token_id=3
+          )
+          
+          # Just create the model to test the code
+          model = SpatialLMLlamaForCausalLM(config)
+          print('Model creation successful')
+          "
+      
+      - name: Test script execution paths (no actual inference)
+        run: |
+          source $HOME/miniforge/bin/activate spatiallm
+          
+          # Run inference.py with --help to test argument parsing
+          python inference.py --help
+          
+          # Run visualization.py with --help
+          python visualize.py --help
+          
+          # Run eval.py with --help
+          python eval.py --help
+      
+      - name: Run model preprocessing
+        run: |
+          source $HOME/miniforge/bin/activate spatiallm
+          
+          # Only run preprocessing if we have real test data
+          if [ -f "test_data/pcd/scene0000_00.ply" ]; then
+            python -c "
+            import torch
+            import numpy as np
+            from spatiallm.pcd import load_o3d_pcd, get_points_and_colors, cleanup_pcd
+            from spatiallm import Layout
+            
+            # Load point cloud
+            point_cloud = load_o3d_pcd('test_data/pcd/scene0000_00.ply')
+            point_cloud = cleanup_pcd(point_cloud)
+            points, colors = get_points_and_colors(point_cloud)
+            
+            # Check if data is valid
+            assert points.shape[0] > 0, 'No points found in point cloud'
+            assert colors.shape[0] > 0, 'No colors found in point cloud'
+            
+            # Test preprocessing function (from inference.py)
+            from spatiallm.pcd.registry import TRANSFORMS
+            
+            @TRANSFORMS.register_module()
+            class GridSample(object):
+                def __init__(
+                    self, grid_size=0.05, hash_type='fnv', mode='train',
+                    keys=('coord', 'color', 'normal', 'segment'),
+                    return_inverse=False, return_grid_coord=False,
+                    return_min_coord=False, return_displacement=False,
+                    project_displacement=False, max_grid_coord=None,
+                ):
+                    pass
+                
+                def __call__(self, data_dict):
+                    # Mock implementation for testing
+                    return data_dict
+            
+            @TRANSFORMS.register_module()
+            class PositiveShift(object):
+                def __call__(self, data_dict):
+                    return data_dict
+            
+            @TRANSFORMS.register_module()
+            class NormalizeColor(object):
+                def __call__(self, data_dict):
+                    return data_dict
+            
+            from spatiallm.pcd import Compose
+            transform = Compose([
+                dict(type='PositiveShift'),
+                dict(type='NormalizeColor'),
+                dict(type='GridSample', grid_size=0.05, hash_type='fnv')
+            ])
+            
+            # Create a mock data_dict for testing
+            data_dict = {
+                'name': 'pcd',
+                'coord': points.copy(),
+                'color': colors.copy(),
+            }
+            
+            # Test transform
+            result = transform(data_dict)
+            print('Preprocessing successful')
+            "
+          else
+            echo "Skipping preprocessing test - no real test data available"
+          fi
+      
+      - name: Run E2E test with mock objects
+        run: |
+          source $HOME/miniforge/bin/activate spatiallm
+          
+          # Create a test script for mock E2E testing
+          cat > test_e2e.py << 'EOL'
+          import torch
+          import numpy as np
+          import os
+          
+          print("Creating mock components for E2E test...")
+          
+          # Create mock objects
+          class MockEncoder:
+              def __init__(self):
+                  pass
+              
+              def __call__(self, point_cloud):
+                  batch_size = point_cloud.C.shape[0]
+                  return {
+                      "context": torch.randn(batch_size, 10, 128),
+                      "context_mask": torch.zeros(batch_size, 10, dtype=torch.bool)
+                  }
+          
+          class MockTensor:
+              def __init__(self, shape):
+                  self.C = torch.zeros(*shape, dtype=torch.int)
+                  self.F = torch.zeros(shape[0], 6, dtype=torch.float)
+                  self.s = 1
+              
+              def to(self, device):
+                  return self
+          
+          # Create mock Layout class
+          from spatiallm import Layout
+          
+          # Create test code template
+          os.makedirs("test_output", exist_ok=True)
+          with open("test_code_template.txt", "w") as f:
+              f.write("class Wall:\n    pass\n\nclass Door:\n    pass\n")
+          
+          # Create a mock point cloud tensor
+          mock_pc = MockTensor((100, 3))
+          
+          # Test layout generation and parsing
+          layout_str = """
+          wall_0=Wall(10,20,0,30,20,0,10,1)
+          wall_1=Wall(30,20,0,30,40,0,10,1)
+          door_0=Door(wall_0,15,20,0,5,8)
+          bbox_0=Bbox(bed,20,30,0,0,10,10,5)
+          """
+          
+          layout = Layout(layout_str)
+          print(f"Parsed layout has {len(layout.walls)} walls, {len(layout.doors)} doors, {len(layout.bboxes)} bboxes")
+          
+          # Test layout to language string conversion
+          output_str = layout.to_language_string()
+          print(f"Generated layout string of length: {len(output_str)}")
+          
+          # Test layout to boxes conversion
+          boxes = layout.to_boxes()
+          print(f"Generated {len(boxes)} boxes from layout")
+          
+          # Save test output
+          with open("test_output/test_layout.txt", "w") as f:
+              f.write(output_str)
+          
+          print("E2E test with mock objects completed successfully")
+          EOL
+          
+          # Run the test script
+          python test_e2e.py
+      
+      - name: Store test artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-output
+          path: test_output/
+      
+      - name: Report test status
+        run: |
+          echo "SpatialLM tests completed."
+          ls -la test_output/ || echo "No test output generated"

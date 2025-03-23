@@ -10,37 +10,53 @@ on:
 jobs:
   test-spatiallm:
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        shell: bash -l {0}
     
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
       
+      - name: Create environment file
+        shell: bash
+        run: |
+          cat > environment.yml << EOF
+          name: spatiallm
+          channels:
+            - conda-forge
+            - defaults
+          dependencies:
+            - python=3.11
+            - pip
+            - sparsehash
+            - python-poetry
+          EOF
+      
       - name: Set up Conda
         uses: conda-incubator/setup-miniconda@v2
         with:
           miniconda-version: "latest"
-          python-version: 3.11
           activate-environment: spatiallm
+          environment-file: environment.yml
           auto-activate-base: false
-          channel-priority: strict
-          show-channel-urls: true
+          auto-update-conda: true
       
       - name: Install system dependencies
+        shell: bash
         run: |
           sudo apt-get update && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
-            libgl1-mesa-glx xvfb
+            libgl1 xvfb
 
-      - name: Install Conda packages
+      - name: Display conda info
+        shell: bash -el {0}
         run: |
-          conda install -y -c conda-forge sparsehash python-poetry
+          conda info
+          conda list
       
       - name: Install Python dependencies
+        shell: bash -el {0}
         run: |
+          conda activate spatiallm
           # Install PyTorch CPU version first (before poetry to ensure CPU-only)
-          pip install torch==2.4.1+cpu torchvision==0.19.1+cpu -f https://download.pytorch.org/whl/torch_stable.html
+          pip install torch==2.4.1+cpu torchvision==0.19.1+cpu torchaudio==2.4.1+cpu -f https://download.pytorch.org/whl/torch_stable.html
           
           # Install dependencies with poetry
           poetry config virtualenvs.create false --local
@@ -53,16 +69,20 @@ jobs:
           pip install huggingface_cli rerun-sdk
       
       - name: Log in to Hugging Face
+        shell: bash -el {0}
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: |
+          conda activate spatiallm
           # Skip HF login if token not available
           if [ -n "$HF_TOKEN" ]; then
             huggingface-cli login --token $HF_TOKEN
           fi
       
       - name: Download test data
+        shell: bash -el {0}
         run: |
+          conda activate spatiallm
           # Download test data only if HF_TOKEN is provided
           if [ -n "${{ secrets.HF_TOKEN }}" ]; then
             # Test data
@@ -85,11 +105,15 @@ jobs:
           fi
 
       - name: Run basic import test
+        shell: bash -el {0}
         run: |
+          conda activate spatiallm
           python -c "import spatiallm; print('SpatialLM import successful')"
       
       - name: Test model creation (without actual inference)
+        shell: bash -el {0}
         run: |
+          conda activate spatiallm
           python -c "
           from transformers import AutoConfig
           from spatiallm.model.spatiallm_llama import SpatialLMLlamaConfig, SpatialLMLlamaForCausalLM
@@ -119,7 +143,9 @@ jobs:
           "
       
       - name: Test script execution paths (no actual inference)
+        shell: bash -el {0}
         run: |
+          conda activate spatiallm
           # Run inference.py with --help to test argument parsing
           python inference.py --help
           
@@ -130,7 +156,9 @@ jobs:
           python eval.py --help
       
       - name: Run model preprocessing
+        shell: bash -el {0}
         run: |
+          conda activate spatiallm
           # Only run preprocessing if we have real test data
           if [ -f "test_data/pcd/scene0000_00.ply" ]; then
             python -c "
@@ -199,7 +227,9 @@ jobs:
           fi
       
       - name: Run E2E test with mock objects
+        shell: bash -el {0}
         run: |
+          conda activate spatiallm
           # Create a test script for mock E2E testing
           cat > test_e2e.py << 'EOL'
           import torch
@@ -275,8 +305,11 @@ jobs:
         with:
           name: test-output
           path: test_output/
+          if-no-files-found: warn
       
       - name: Report test status
+        shell: bash -el {0}
         run: |
+          conda activate spatiallm
           echo "SpatialLM tests completed."
           ls -la test_output/ || echo "No test output generated"
